@@ -2078,6 +2078,10 @@ UPB_INLINE upb_oneofdef *upb_msgdef_ntoo_mutable(upb_msgdef *m,
 void upb_msgdef_setmapentry(upb_msgdef *m, bool map_entry);
 bool upb_msgdef_mapentry(const upb_msgdef *m);
 
+// Well-known field tag numbers for map-entry messages.
+#define UPB_MAPENTRY_KEY   1
+#define UPB_MAPENTRY_VALUE 2
+
 const upb_oneofdef *upb_msgdef_findoneof(const upb_msgdef *m,
                                           const char *name);
 int upb_msgdef_numoneofs(const upb_msgdef *m);
@@ -7822,12 +7826,28 @@ class Parser;
 
 UPB_DECLARE_TYPE(upb::json::Parser, upb_json_parser);
 
-// Internal-only struct used by the parser.
+// Internal-only struct used by the parser. A parser frame corresponds
+// one-to-one with a handler (sink) frame.
 typedef struct {
  UPB_PRIVATE_FOR_CPP
   upb_sink sink;
+  // The current message in which we're parsing, and the field whose value we're
+  // expecting next.
   const upb_msgdef *m;
   const upb_fielddef *f;
+
+  // In a repeated-field context, ready to emit mapentries as submessages. This
+  // flag alters the start-of-object (open-brace) behavior to begin a sequence
+  // of mapentry messages rather than a single submessage.
+  bool is_map;
+  // In a map-entry message context. This flag is set when parsing the value
+  // field of a single map entry and indicates to all value-field parsers
+  // (subobjects, strings, numbers, and bools) that the map-entry submessage
+  // should end as soon as the value is parsed.
+  bool is_mapentry;
+  // If |is_map| or |is_mapentry| is true, |mapfield| refers to the parent
+  // message's map field that we're currently parsing.
+  const upb_fielddef *mapfield;
 } upb_jsonparser_frame;
 
 

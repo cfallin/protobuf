@@ -3773,12 +3773,16 @@ char *upb_strdup(const char *s) {
 }
 
 char *upb_strdup2(const char *s, size_t len) {
+  // Prevent overflow errors.
+  if (len == SIZE_MAX) return NULL;
   // Always null-terminate, even if binary data; but don't rely on the input to
   // have a null-terminating byte since it may be a raw binary buffer.
   size_t n = len + 1;
   char *p = malloc(n);
-  if (p) memcpy(p, s, len);
-  p[len] = 0;
+  if (p) {
+    memcpy(p, s, len);
+    p[len] = 0;
+  }
   return p;
 }
 
@@ -9218,7 +9222,6 @@ badpadding:
 //      the true value in a contiguous buffer.
 
 static void assert_accumulate_empty(upb_json_parser *p) {
-  UPB_UNUSED(p);
   assert(p->accumulated == NULL);
   assert(p->accumulated_len == 0);
 }
@@ -9498,10 +9501,31 @@ static bool end_text(upb_json_parser *p, const char *ptr) {
   return capture_end(p, ptr);
 }
 
+static void check_end_mapentry(upb_json_parser *p) {
+  // If we just parsed a map-entry value, end that frame too.
+  if (p->top->is_mapentry) {
+    assert(p->top > p->stack);
+    // send ENDMSG on submsg.
+    upb_status s = UPB_STATUS_INIT;
+    upb_sink_endmsg(&p->top->sink, &s);
+    const upb_fielddef* mapfield = p->top->mapfield;
+
+    // send ENDSUBMSG in repeated-field-of-mapentries frame.
+    p->top--;
+    upb_selector_t sel;
+    bool ok = upb_handlers_getselector(mapfield,
+                                       UPB_HANDLER_ENDSUBMSG, &sel);
+    UPB_ASSERT_VAR(ok, ok);
+    upb_sink_endsubmsg(&p->top->sink, sel);
+  }
+}
+
 static void start_number(upb_json_parser *p, const char *ptr) {
   multipart_startaccum(p);
   capture_begin(p, ptr);
 }
+
+static bool parse_number(upb_json_parser *p, const char *buf, const char *end);
 
 static bool end_number(upb_json_parser *p, const char *ptr) {
   if (!capture_end(p, ptr)) {
@@ -9517,8 +9541,12 @@ static bool end_number(upb_json_parser *p, const char *ptr) {
   size_t len;
   const char *buf = accumulate_getptr(p, &len);
   const char *myend = buf + len - 1;  // One for NULL.
-  char *end;
+  return parse_number(p, buf, myend);
+}
 
+static bool parse_number(upb_json_parser *p, const char *buf,
+                         const char *myend) {
+  char *end;
   switch (upb_fielddef_type(p->top->f)) {
     case UPB_TYPE_ENUM:
     case UPB_TYPE_INT32: {
@@ -9574,6 +9602,9 @@ static bool end_number(upb_json_parser *p, const char *ptr) {
   }
 
   multipart_end(p);
+
+  check_end_mapentry(p);
+
   return true;
 
 err:
@@ -9592,6 +9623,9 @@ static bool parser_putbool(upb_json_parser *p, bool val) {
 
   bool ok = upb_sink_putbool(&p->top->sink, parser_getsel(p), val);
   UPB_ASSERT_VAR(ok, ok);
+
+  check_end_mapentry(p);
+
   return true;
 }
 
@@ -9608,6 +9642,8 @@ static bool start_stringval(upb_json_parser *p) {
     upb_sink_startstr(&p->top->sink, sel, 0, &inner->sink);
     inner->m = p->top->m;
     inner->f = p->top->f;
+    inner->is_map = false;
+    inner->is_mapentry = false;
     p->top = inner;
 
     if (upb_fielddef_type(p->top->f) == UPB_TYPE_STRING) {
@@ -9685,6 +9721,9 @@ static bool end_stringval(upb_json_parser *p) {
   }
 
   multipart_end(p);
+
+  check_end_mapentry(p);
+
   return ok;
 }
 
@@ -9693,23 +9732,141 @@ static void start_member(upb_json_parser *p) {
   multipart_startaccum(p);
 }
 
-static bool end_member(upb_json_parser *p) {
-  assert(!p->top->f);
+// Helper: invoked during parse_mapentry() to emit the mapentry message's key
+// field based on the current contents of the accumulate buffer.
+static bool parse_mapentry_key(upb_json_parser *p) {
+
   size_t len;
   const char *buf = accumulate_getptr(p, &len);
 
-  const upb_fielddef *f = upb_msgdef_ntof(p->top->m, buf, len);
+  // Emit the key field. We do a bit of ad-hoc parsing here because the
+  // parser state machine has already decided that this is a string field
+  // name, and we are reinterpreting it as some arbitrary key type. In
+  // particular, integer and bool keys are quoted, so we need to parse the
+  // quoted string contents here.
 
-  if (!f) {
-    // TODO(haberman): Ignore unknown fields if requested/configured to do so.
-    upb_status_seterrf(p->status, "No such field: %.*s\n", (int)len, buf);
+  p->top->f = upb_msgdef_itof(p->top->m, UPB_MAPENTRY_KEY);
+  if (p->top->f == NULL) {
+    upb_status_seterrmsg(p->status, "mapentry message has no key");
+    return false;
+  }
+  switch (upb_fielddef_type(p->top->f)) {
+    case UPB_TYPE_INT32:
+    case UPB_TYPE_INT64:
+    case UPB_TYPE_UINT32:
+    case UPB_TYPE_UINT64:
+      // Invoke end_number. The accum buffer has the number's text already.
+      if (!parse_number(p, buf, buf + len)) {
+        return false;
+      }
+      break;
+    case UPB_TYPE_BOOL:
+      if (len == 4 && !strncmp(buf, "true", 4)) {
+        if (!parser_putbool(p, true)) {
+          return false;
+        }
+      } else if (len == 5 && !strncmp(buf, "false", 5)) {
+        if (!parser_putbool(p, false)) {
+          return false;
+        }
+      } else {
+        upb_status_seterrmsg(p->status,
+                             "Map bool key not 'true' or 'false'");
+        return false;
+      }
+      multipart_end(p);
+      break;
+    case UPB_TYPE_STRING:
+    case UPB_TYPE_BYTES: {
+      upb_sink subsink;
+      upb_selector_t sel = getsel_for_handlertype(p, UPB_HANDLER_STARTSTR);
+      upb_sink_startstr(&p->top->sink, sel, len, &subsink);
+      sel = getsel_for_handlertype(p, UPB_HANDLER_STRING);
+      upb_sink_putstring(&subsink, sel, buf, len, NULL);
+      sel = getsel_for_handlertype(p, UPB_HANDLER_ENDSTR);
+      upb_sink_endstr(&subsink, sel);
+      multipart_end(p);
+      break;
+    }
+    default:
+      upb_status_seterrmsg(p->status, "Invalid field type for map key");
+      return false;
+  }
+
+  return true;
+}
+
+// Helper: emit one map entry (as a submessage in the map field sequence). This
+// is invoked from end_member(), at the end of the map entry's key string, with
+// the map key in the accumulate buffer. It parses the key from that buffer,
+// emits the handler calls to start the mapentry submessage (setting up its
+// subframe in the process), and sets up state in the subframe so that the
+// value parser (invoked next) will emit the mapentry's value field and then
+// end the mapentry message.
+
+static bool handle_mapentry(upb_json_parser *p) {
+  // Map entry: p->top->sink is the seq frame, so we need to start a frame
+  // for the mapentry itself, and then set |f| in that frame so that the map
+  // value field is parsed, and also set a flag to end the frame after the
+  // map-entry value is parsed.
+  if (!check_stack(p)) return false;
+
+  const upb_fielddef *mapfield = p->top->mapfield;
+  const upb_msgdef *mapentrymsg = upb_fielddef_msgsubdef(mapfield);
+
+  upb_jsonparser_frame *inner = p->top + 1;
+  p->top->f = mapfield;
+  upb_selector_t sel = getsel_for_handlertype(p, UPB_HANDLER_STARTSUBMSG);
+  upb_sink_startsubmsg(&p->top->sink, sel, &inner->sink);
+  inner->m = mapentrymsg;
+  inner->mapfield = mapfield;
+  inner->is_map = false;
+
+  // Don't set this to true *yet* -- we reuse parsing handlers below to push
+  // the key field value to the sink, and these handlers will pop the frame
+  // if they see is_mapentry (when invoked by the parser state machine, they
+  // would have just seen the map-entry value, not key).
+  inner->is_mapentry = false;
+  p->top = inner;
+
+  // send STARTMSG in submsg frame.
+  upb_sink_startmsg(&p->top->sink);
+
+  parse_mapentry_key(p);
+
+  // Set up the value field to receive the map-entry value.
+  p->top->f = upb_msgdef_itof(p->top->m, UPB_MAPENTRY_VALUE);
+  p->top->is_mapentry = true;  // set up to pop frame after value is parsed.
+  p->top->mapfield = mapfield;
+  if (p->top->f == NULL) {
+    upb_status_seterrmsg(p->status, "mapentry message has no value");
     return false;
   }
 
-  p->top->f = f;
-  multipart_end(p);
-
   return true;
+}
+
+static bool end_member(upb_json_parser *p) {
+  assert(!p->top->f);
+
+  if (p->top->is_map) {
+    return handle_mapentry(p);
+  } else {
+    size_t len;
+    const char *buf = accumulate_getptr(p, &len);
+    const upb_fielddef *f = upb_msgdef_ntof(p->top->m, buf, len);
+
+    if (!f) {
+      // TODO(haberman): Ignore unknown fields if requested/configured to do so.
+      upb_status_seterrf(p->status, "No such field: %.*s\n", (int)len, buf);
+      return false;
+    }
+
+    p->top->f = f;
+    multipart_end(p);
+
+    return true;
+  }
 }
 
 static void clear_member(upb_json_parser *p) { p->top->f = NULL; }
@@ -9717,30 +9874,60 @@ static void clear_member(upb_json_parser *p) { p->top->f = NULL; }
 static bool start_subobject(upb_json_parser *p) {
   assert(p->top->f);
 
-  if (!upb_fielddef_issubmsg(p->top->f)) {
+  if (upb_fielddef_isseq(p->top->f) &&
+      upb_fielddef_type(p->top->f) == UPB_TYPE_MESSAGE &&
+      upb_msgdef_mapentry(upb_fielddef_msgsubdef(p->top->f))) {
+    // Beginning of a map. Start a new parser frame in a repeated-field
+    // context.
+    if (!check_stack(p)) return false;
+
+    upb_jsonparser_frame *inner = p->top + 1;
+    upb_selector_t sel = getsel_for_handlertype(p, UPB_HANDLER_STARTSEQ);
+    upb_sink_startseq(&p->top->sink, sel, &inner->sink);
+    inner->m = upb_fielddef_msgsubdef(p->top->f);
+    inner->mapfield = p->top->f;
+    inner->f = NULL;
+    inner->is_map = true;
+    inner->is_mapentry = false;
+    p->top = inner;
+
+    return true;
+  } else if (upb_fielddef_issubmsg(p->top->f)) {
+    // Beginning of a subobject. Start a new parser frame in the submsg
+    // context.
+    if (!check_stack(p)) return false;
+
+    upb_jsonparser_frame *inner = p->top + 1;
+
+    upb_selector_t sel = getsel_for_handlertype(p, UPB_HANDLER_STARTSUBMSG);
+    upb_sink_startsubmsg(&p->top->sink, sel, &inner->sink);
+    inner->m = upb_fielddef_msgsubdef(p->top->f);
+    inner->f = NULL;
+    inner->is_map = false;
+    inner->is_mapentry = false;
+    p->top = inner;
+
+    return true;
+  } else {
     upb_status_seterrf(p->status,
                        "Object specified for non-message/group field: %s",
                        upb_fielddef_name(p->top->f));
     return false;
   }
-
-  if (!check_stack(p)) return false;
-
-  upb_jsonparser_frame *inner = p->top + 1;
-
-  upb_selector_t sel = getsel_for_handlertype(p, UPB_HANDLER_STARTSUBMSG);
-  upb_sink_startsubmsg(&p->top->sink, sel, &inner->sink);
-  inner->m = upb_fielddef_msgsubdef(p->top->f);
-  inner->f = NULL;
-  p->top = inner;
-
-  return true;
 }
 
 static void end_subobject(upb_json_parser *p) {
-  p->top--;
-  upb_selector_t sel = getsel_for_handlertype(p, UPB_HANDLER_ENDSUBMSG);
-  upb_sink_endsubmsg(&p->top->sink, sel);
+  if (p->top->is_map) {
+    p->top--;
+    upb_selector_t sel = getsel_for_handlertype(p, UPB_HANDLER_ENDSEQ);
+    upb_sink_endseq(&p->top->sink, sel);
+  } else {
+    p->top--;
+    upb_selector_t sel = getsel_for_handlertype(p, UPB_HANDLER_ENDSUBMSG);
+    upb_sink_endsubmsg(&p->top->sink, sel);
+
+    check_end_mapentry(p);
+  }
 }
 
 static bool start_array(upb_json_parser *p) {
@@ -9760,6 +9947,8 @@ static bool start_array(upb_json_parser *p) {
   upb_sink_startseq(&p->top->sink, sel, &inner->sink);
   inner->m = p->top->m;
   inner->f = p->top->f;
+  inner->is_map = false;
+  inner->is_mapentry = false;
   p->top = inner;
 
   return true;
@@ -9774,12 +9963,16 @@ static void end_array(upb_json_parser *p) {
 }
 
 static void start_object(upb_json_parser *p) {
-  upb_sink_startmsg(&p->top->sink);
+  if (!p->top->is_map) {
+    upb_sink_startmsg(&p->top->sink);
+  }
 }
 
 static void end_object(upb_json_parser *p) {
-  upb_status status;
-  upb_sink_endmsg(&p->top->sink, &status);
+  if (!p->top->is_map) {
+    upb_status status;
+    upb_sink_endmsg(&p->top->sink, &status);
+  }
 }
 
 
@@ -9804,11 +9997,11 @@ static void end_object(upb_json_parser *p) {
 // final state once, when the closing '"' is seen.
 
 
-#line 905 "upb/json/parser.rl"
+#line 1094 "upb/json/parser.rl"
 
 
 
-#line 817 "upb/json/parser.c"
+#line 1006 "upb/json/parser.c"
 static const char _json_actions[] = {
 	0, 1, 0, 1, 2, 1, 3, 1, 
 	5, 1, 6, 1, 7, 1, 8, 1, 
@@ -9959,7 +10152,7 @@ static const int json_en_value_machine = 27;
 static const int json_en_main = 1;
 
 
-#line 908 "upb/json/parser.rl"
+#line 1097 "upb/json/parser.rl"
 
 size_t parse(void *closure, const void *hd, const char *buf, size_t size,
              const upb_bufhandle *handle) {
@@ -9979,7 +10172,7 @@ size_t parse(void *closure, const void *hd, const char *buf, size_t size,
   capture_resume(parser, buf);
 
   
-#line 988 "upb/json/parser.c"
+#line 1177 "upb/json/parser.c"
 	{
 	int _klen;
 	unsigned int _trans;
@@ -10054,118 +10247,118 @@ _match:
 		switch ( *_acts++ )
 		{
 	case 0:
-#line 820 "upb/json/parser.rl"
+#line 1009 "upb/json/parser.rl"
 	{ p--; {cs = stack[--top]; goto _again;} }
 	break;
 	case 1:
-#line 821 "upb/json/parser.rl"
+#line 1010 "upb/json/parser.rl"
 	{ p--; {stack[top++] = cs; cs = 10; goto _again;} }
 	break;
 	case 2:
-#line 825 "upb/json/parser.rl"
+#line 1014 "upb/json/parser.rl"
 	{ start_text(parser, p); }
 	break;
 	case 3:
-#line 826 "upb/json/parser.rl"
+#line 1015 "upb/json/parser.rl"
 	{ CHECK_RETURN_TOP(end_text(parser, p)); }
 	break;
 	case 4:
-#line 832 "upb/json/parser.rl"
+#line 1021 "upb/json/parser.rl"
 	{ start_hex(parser); }
 	break;
 	case 5:
-#line 833 "upb/json/parser.rl"
+#line 1022 "upb/json/parser.rl"
 	{ hexdigit(parser, p); }
 	break;
 	case 6:
-#line 834 "upb/json/parser.rl"
+#line 1023 "upb/json/parser.rl"
 	{ CHECK_RETURN_TOP(end_hex(parser)); }
 	break;
 	case 7:
-#line 840 "upb/json/parser.rl"
+#line 1029 "upb/json/parser.rl"
 	{ CHECK_RETURN_TOP(escape(parser, p)); }
 	break;
 	case 8:
-#line 846 "upb/json/parser.rl"
+#line 1035 "upb/json/parser.rl"
 	{ p--; {cs = stack[--top]; goto _again;} }
 	break;
 	case 9:
-#line 849 "upb/json/parser.rl"
+#line 1038 "upb/json/parser.rl"
 	{ {stack[top++] = cs; cs = 19; goto _again;} }
 	break;
 	case 10:
-#line 851 "upb/json/parser.rl"
+#line 1040 "upb/json/parser.rl"
 	{ p--; {stack[top++] = cs; cs = 27; goto _again;} }
 	break;
 	case 11:
-#line 856 "upb/json/parser.rl"
+#line 1045 "upb/json/parser.rl"
 	{ start_member(parser); }
 	break;
 	case 12:
-#line 857 "upb/json/parser.rl"
+#line 1046 "upb/json/parser.rl"
 	{ CHECK_RETURN_TOP(end_member(parser)); }
 	break;
 	case 13:
-#line 860 "upb/json/parser.rl"
+#line 1049 "upb/json/parser.rl"
 	{ clear_member(parser); }
 	break;
 	case 14:
-#line 866 "upb/json/parser.rl"
+#line 1055 "upb/json/parser.rl"
 	{ start_object(parser); }
 	break;
 	case 15:
-#line 869 "upb/json/parser.rl"
+#line 1058 "upb/json/parser.rl"
 	{ end_object(parser); }
 	break;
 	case 16:
-#line 875 "upb/json/parser.rl"
+#line 1064 "upb/json/parser.rl"
 	{ CHECK_RETURN_TOP(start_array(parser)); }
 	break;
 	case 17:
-#line 879 "upb/json/parser.rl"
+#line 1068 "upb/json/parser.rl"
 	{ end_array(parser); }
 	break;
 	case 18:
-#line 884 "upb/json/parser.rl"
+#line 1073 "upb/json/parser.rl"
 	{ start_number(parser, p); }
 	break;
 	case 19:
-#line 885 "upb/json/parser.rl"
+#line 1074 "upb/json/parser.rl"
 	{ CHECK_RETURN_TOP(end_number(parser, p)); }
 	break;
 	case 20:
-#line 887 "upb/json/parser.rl"
+#line 1076 "upb/json/parser.rl"
 	{ CHECK_RETURN_TOP(start_stringval(parser)); }
 	break;
 	case 21:
-#line 888 "upb/json/parser.rl"
+#line 1077 "upb/json/parser.rl"
 	{ CHECK_RETURN_TOP(end_stringval(parser)); }
 	break;
 	case 22:
-#line 890 "upb/json/parser.rl"
+#line 1079 "upb/json/parser.rl"
 	{ CHECK_RETURN_TOP(parser_putbool(parser, true)); }
 	break;
 	case 23:
-#line 892 "upb/json/parser.rl"
+#line 1081 "upb/json/parser.rl"
 	{ CHECK_RETURN_TOP(parser_putbool(parser, false)); }
 	break;
 	case 24:
-#line 894 "upb/json/parser.rl"
+#line 1083 "upb/json/parser.rl"
 	{ /* null value */ }
 	break;
 	case 25:
-#line 896 "upb/json/parser.rl"
+#line 1085 "upb/json/parser.rl"
 	{ CHECK_RETURN_TOP(start_subobject(parser)); }
 	break;
 	case 26:
-#line 897 "upb/json/parser.rl"
+#line 1086 "upb/json/parser.rl"
 	{ end_subobject(parser); }
 	break;
 	case 27:
-#line 902 "upb/json/parser.rl"
+#line 1091 "upb/json/parser.rl"
 	{ p--; {cs = stack[--top]; goto _again;} }
 	break;
-#line 1174 "upb/json/parser.c"
+#line 1363 "upb/json/parser.c"
 		}
 	}
 
@@ -10178,7 +10371,7 @@ _again:
 	_out: {}
 	}
 
-#line 927 "upb/json/parser.rl"
+#line 1116 "upb/json/parser.rl"
 
   if (p != pe) {
     upb_status_seterrf(parser->status, "Parse error at %s\n", p);
@@ -10222,18 +10415,20 @@ void upb_json_parser_uninit(upb_json_parser *p) {
 void upb_json_parser_reset(upb_json_parser *p) {
   p->top = p->stack;
   p->top->f = NULL;
+  p->top->is_map = false;
+  p->top->is_mapentry = false;
 
   int cs;
   int top;
   // Emit Ragel initialization of the parser.
   
-#line 1236 "upb/json/parser.c"
+#line 1427 "upb/json/parser.c"
 	{
 	cs = json_start;
 	top = 0;
 	}
 
-#line 975 "upb/json/parser.rl"
+#line 1166 "upb/json/parser.rl"
   p->current_state = cs;
   p->parser_top = top;
   accumulate_clear(p);
@@ -10434,9 +10629,22 @@ static bool putkey(void *closure, const void *handler_data) {
     return true;                                                             \
   }                                                                          \
   static bool repeated_##type(void *closure, const void *handler_data,       \
-                            type val) {                                      \
+                              type val) {                                    \
     upb_json_printer *p = closure;                                           \
     print_comma(p);                                                          \
+    CHK(put##type(closure, handler_data, val));                              \
+    return true;                                                             \
+  }                                                                          \
+  static bool mapkey_##type(void *closure, const void *handler_data,         \
+                            type val) {                                      \
+    upb_json_printer *p = closure;                                           \
+    print_data(p, "\"", 1);                                                  \
+    CHK(put##type(closure, handler_data, val));                              \
+    print_data(p, "\":", 2);                                                 \
+    return true;                                                             \
+  }                                                                          \
+  static bool mapvalue_##type(void *closure, const void *handler_data,       \
+                            type val) {                                      \
     CHK(put##type(closure, handler_data, val));                              \
     return true;                                                             \
   }
@@ -10492,6 +10700,23 @@ static bool repeated_enum(void *closure, const void *handler_data,
   return true;
 }
 
+static bool mapvalue_enum(void *closure, const void *handler_data,
+                          int32_t val) {
+  const EnumHandlerData *hd = handler_data;
+  upb_json_printer *p = closure;
+
+  const char *symbolic_name = upb_enumdef_iton(hd->enumdef, val);
+  if (symbolic_name) {
+    print_data(p, "\"", 1);
+    putstring(p, symbolic_name, strlen(symbolic_name));
+    print_data(p, "\"", 1);
+  } else {
+    putint32_t(closure, NULL, val);
+  }
+
+  return true;
+}
+
 static void *scalar_startsubmsg(void *closure, const void *handler_data) {
   return putkey(closure, handler_data) ? closure : UPB_BREAK;
 }
@@ -10503,7 +10728,7 @@ static void *repeated_startsubmsg(void *closure, const void *handler_data) {
   return closure;
 }
 
-static bool startmap(void *closure, const void *handler_data) {
+static bool printer_startmsg(void *closure, const void *handler_data) {
   UPB_UNUSED(handler_data);
   upb_json_printer *p = closure;
   if (p->depth_++ == 0) {
@@ -10514,7 +10739,7 @@ static bool startmap(void *closure, const void *handler_data) {
   return true;
 }
 
-static bool endmap(void *closure, const void *handler_data, upb_status *s) {
+static bool printer_endmsg(void *closure, const void *handler_data, upb_status *s) {
   UPB_UNUSED(handler_data);
   UPB_UNUSED(s);
   upb_json_printer *p = closure;
@@ -10538,6 +10763,23 @@ static bool endseq(void *closure, const void *handler_data) {
   UPB_UNUSED(handler_data);
   upb_json_printer *p = closure;
   print_data(p, "]", 1);
+  p->depth_--;
+  return true;
+}
+
+static void *startmap(void *closure, const void *handler_data) {
+  upb_json_printer *p = closure;
+  CHK(putkey(closure, handler_data));
+  p->depth_++;
+  p->first_elem_[p->depth_] = true;
+  print_data(p, "{", 1);
+  return closure;
+}
+
+static bool endmap(void *closure, const void *handler_data) {
+  UPB_UNUSED(handler_data);
+  upb_json_printer *p = closure;
+  print_data(p, "}", 1);
   p->depth_--;
   return true;
 }
@@ -10656,6 +10898,52 @@ static bool repeated_endstr(void *closure, const void *handler_data) {
   return true;
 }
 
+static void *mapkey_startstr(void *closure, const void *handler_data,
+                             size_t size_hint) {
+  UPB_UNUSED(handler_data);
+  UPB_UNUSED(size_hint);
+  upb_json_printer *p = closure;
+  print_data(p, "\"", 1);
+  return p;
+}
+
+static size_t mapkey_str(void *closure, const void *handler_data,
+                         const char *str, size_t len,
+                         const upb_bufhandle *handle) {
+  CHK(putstr(closure, handler_data, str, len, handle));
+  return len;
+}
+
+static bool mapkey_endstr(void *closure, const void *handler_data) {
+  UPB_UNUSED(handler_data);
+  upb_json_printer *p = closure;
+  print_data(p, "\":", 2);
+  return true;
+}
+
+static void *mapvalue_startstr(void *closure, const void *handler_data,
+                               size_t size_hint) {
+  UPB_UNUSED(handler_data);
+  UPB_UNUSED(size_hint);
+  upb_json_printer *p = closure;
+  print_data(p, "\"", 1);
+  return p;
+}
+
+static size_t mapvalue_str(void *closure, const void *handler_data,
+                           const char *str, size_t len,
+                           const upb_bufhandle *handle) {
+  CHK(putstr(closure, handler_data, str, len, handle));
+  return len;
+}
+
+static bool mapvalue_endstr(void *closure, const void *handler_data) {
+  UPB_UNUSED(handler_data);
+  upb_json_printer *p = closure;
+  print_data(p, "\"", 1);
+  return true;
+}
+
 static size_t scalar_bytes(void *closure, const void *handler_data,
                            const char *str, size_t len,
                            const upb_bufhandle *handle) {
@@ -10673,31 +10961,62 @@ static size_t repeated_bytes(void *closure, const void *handler_data,
   return len;
 }
 
+static size_t mapkey_bytes(void *closure, const void *handler_data,
+                           const char *str, size_t len,
+                           const upb_bufhandle *handle) {
+  upb_json_printer *p = closure;
+  CHK(putbytes(closure, handler_data, str, len, handle));
+  print_data(p, ":", 1);
+  return len;
+}
+
+static size_t mapvalue_bytes(void *closure, const void *handler_data,
+                             const char *str, size_t len,
+                             const upb_bufhandle *handle) {
+  CHK(putbytes(closure, handler_data, str, len, handle));
+  return len;
+}
+
 void printer_sethandlers(const void *closure, upb_handlers *h) {
   UPB_UNUSED(closure);
-
+  const upb_msgdef *md = upb_handlers_msgdef(h);
+  bool is_mapentry = upb_msgdef_mapentry(md);
   upb_handlerattr empty_attr = UPB_HANDLERATTR_INITIALIZER;
-  upb_handlers_setstartmsg(h, startmap, &empty_attr);
-  upb_handlers_setendmsg(h, endmap, &empty_attr);
 
-#define TYPE(type, name, ctype)                                    \
-  case type:                                                       \
-    if (upb_fielddef_isseq(f)) {                                   \
-      upb_handlers_set##name(h, f, repeated_##ctype, &empty_attr); \
-    } else {                                                       \
-      upb_handlers_set##name(h, f, scalar_##ctype, &name_attr);    \
-    }                                                              \
+  if (!is_mapentry) {
+    // The surrounding { } object delimiters are provided for normal messages,
+    // but not for mapentry messages. A mapentry message is printed simply as
+    // '"key": value'.
+    upb_handlers_setstartmsg(h, printer_startmsg, &empty_attr);
+    upb_handlers_setendmsg(h, printer_endmsg, &empty_attr);
+  }
+
+#define TYPE(type, name, ctype)                                               \
+  case type:                                                                  \
+    if (is_mapentry && upb_fielddef_number(f) == UPB_MAPENTRY_KEY) {          \
+      upb_handlers_set##name(h, f, mapkey_##ctype, &empty_attr);              \
+    } else if (is_mapentry && upb_fielddef_number(f) == UPB_MAPENTRY_VALUE) { \
+      upb_handlers_set##name(h, f, mapvalue_##ctype, &empty_attr);            \
+    } else if (upb_fielddef_isseq(f)) {                                       \
+      upb_handlers_set##name(h, f, repeated_##ctype, &empty_attr);            \
+    } else {                                                                  \
+      upb_handlers_set##name(h, f, scalar_##ctype, &name_attr);               \
+    }                                                                         \
     break;
 
   upb_msg_field_iter i;
-  upb_msg_field_begin(&i, upb_handlers_msgdef(h));
+  upb_msg_field_begin(&i, md);
   for(; !upb_msg_field_done(&i); upb_msg_field_next(&i)) {
     const upb_fielddef *f = upb_msg_iter_field(&i);
 
     upb_handlerattr name_attr = UPB_HANDLERATTR_INITIALIZER;
     upb_handlerattr_sethandlerdata(&name_attr, newstrpc(h, f));
 
-    if (upb_fielddef_isseq(f)) {
+    if (upb_fielddef_type(f) == UPB_TYPE_MESSAGE &&
+        upb_msgdef_mapentry(upb_fielddef_msgsubdef(f))) {
+      upb_handlers_setstartseq(h, f, startmap, &name_attr);
+      upb_handlers_setendseq(h, f, endmap, &name_attr);
+    } else if (upb_fielddef_isseq(f)) {
       upb_handlers_setstartseq(h, f, startseq, &name_attr);
       upb_handlers_setendseq(h, f, endseq, &empty_attr);
     }
@@ -10721,7 +11040,11 @@ void printer_sethandlers(const void *closure, upb_handlers *h) {
         upb_handlerattr enum_attr = UPB_HANDLERATTR_INITIALIZER;
         upb_handlerattr_sethandlerdata(&enum_attr, hd);
 
-        if (upb_fielddef_isseq(f)) {
+        if (is_mapentry) {
+          // can only be value, not key.
+          assert(upb_fielddef_number(f) == UPB_MAPENTRY_VALUE);
+          upb_handlers_setint32(h, f, mapvalue_enum, &enum_attr);
+        } else if (upb_fielddef_isseq(f)) {
           upb_handlers_setint32(h, f, repeated_enum, &enum_attr);
         } else {
           upb_handlers_setint32(h, f, scalar_enum, &enum_attr);
@@ -10731,7 +11054,17 @@ void printer_sethandlers(const void *closure, upb_handlers *h) {
         break;
       }
       case UPB_TYPE_STRING:
-        if (upb_fielddef_isseq(f)) {
+        if (is_mapentry &&
+            upb_fielddef_number(f) == UPB_MAPENTRY_KEY) {
+          upb_handlers_setstartstr(h, f, mapkey_startstr, &empty_attr);
+          upb_handlers_setstring(h, f, mapkey_str, &empty_attr);
+          upb_handlers_setendstr(h, f, mapkey_endstr, &empty_attr);
+        } else if (is_mapentry &&
+                   upb_fielddef_number(f) == UPB_MAPENTRY_VALUE) {
+          upb_handlers_setstartstr(h, f, mapvalue_startstr, &empty_attr);
+          upb_handlers_setstring(h, f, mapvalue_str, &empty_attr);
+          upb_handlers_setendstr(h, f, mapvalue_endstr, &empty_attr);
+        } else if (upb_fielddef_isseq(f)) {
           upb_handlers_setstartstr(h, f, repeated_startstr, &empty_attr);
           upb_handlers_setstring(h, f, repeated_str, &empty_attr);
           upb_handlers_setendstr(h, f, repeated_endstr, &empty_attr);
@@ -10744,14 +11077,25 @@ void printer_sethandlers(const void *closure, upb_handlers *h) {
       case UPB_TYPE_BYTES:
         // XXX: this doesn't support strings that span buffers yet. The base64
         // encoder will need to be made resumable for this to work properly.
-        if (upb_fielddef_isseq(f)) {
+        if (is_mapentry &&
+            upb_fielddef_number(f) == UPB_MAPENTRY_KEY) {
+          upb_handlers_setstring(h, f, mapkey_bytes, &empty_attr);
+        } else if (is_mapentry &&
+                   upb_fielddef_number(f) == UPB_MAPENTRY_VALUE) {
+          upb_handlers_setstring(h, f, mapvalue_bytes, &empty_attr);
+        } else if (upb_fielddef_isseq(f)) {
           upb_handlers_setstring(h, f, repeated_bytes, &empty_attr);
         } else {
           upb_handlers_setstring(h, f, scalar_bytes, &name_attr);
         }
         break;
       case UPB_TYPE_MESSAGE:
-        if (upb_fielddef_isseq(f)) {
+        if (is_mapentry) {
+          // can only be value, not key.
+          assert(upb_fielddef_number(f) == UPB_MAPENTRY_VALUE);
+          // No handler necessary -- the submsg handlers will print the message
+          // as appropriate.
+        } else if (upb_fielddef_isseq(f)) {
           upb_handlers_setstartsubmsg(h, f, repeated_startsubmsg, &name_attr);
         } else {
           upb_handlers_setstartsubmsg(h, f, scalar_startsubmsg, &name_attr);

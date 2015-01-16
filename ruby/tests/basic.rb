@@ -60,6 +60,9 @@ module BasicTest
     add_message "MapMessage" do
       map :map_string_int32, :string, :int32, 1
       map :map_string_msg, :string, :message, 2, "TestMessage2"
+      map :map_int32_int32, :int32, :int32, 3
+      map :map_bool_int32, :bool, :int32, 4
+      map :map_string_enum, :string, :enum, 5, "TestEnum"
     end
     add_message "MapMessageWireEquiv" do
       repeated :map_string_int32, :message, 1, "MapMessageWireEquiv_entry1"
@@ -990,6 +993,32 @@ module BasicTest
       json_text = TestMessage.encode_json(m)
       m2 = TestMessage.decode_json(json_text)
       assert m == m2
+    end
+
+    def test_json_map
+      m = MapMessage.new
+      m.map_string_int32["a"] = 1
+      m.map_string_msg["c"] = TestMessage2.new(:foo => 42)
+      m.map_string_enum["e"] = :B
+      m.map_int32_int32[42] = 1
+      m.map_bool_int32[true] = 2
+
+      expected_json = '{"map_string_int32":{"a":1},"map_string_msg":' +
+                      '{"c":{"foo":42}},"map_int32_int32":{"42":1},' +
+                      '"map_bool_int32":{"true":2},"map_string_enum":{"e":"B"}}'
+      assert MapMessage.encode_json(m) == expected_json
+
+      # we avoided placing more than one entry in each map above to avoid test
+      # dependences on hashtable ordering. For this equality test, however, we
+      # should add more to ensure that serialization and parsing of
+      # multiple-entry maps works.
+      m.map_string_int32["b"] = 2
+      m.map_string_int32["c"] = 3
+      m.map_bool_int32[false] = 3
+      m.map_int32_int32[-1] = 100
+
+      m2 = MapMessage.decode_json(MapMessage.encode_json(m))
+      assert m2 == m
     end
   end
 end
