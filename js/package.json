@@ -1,0 +1,9 @@
+{
+  "name": "google_protobuf_js",
+  "version": "3.0.0",
+  "description": "Google Protobuf library",
+  "scripts": {
+    "test": "NODE_PATH=lib/ ./node-wrapper test/test.js"
+  },
+  "main": "lib/google_protobuf_js.js"
+}
