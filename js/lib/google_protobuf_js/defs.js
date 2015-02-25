@@ -10,7 +10,7 @@ function readonlyList(l) {
 }
 
 function isInstance(obj, klass) {
-  return obj.__proto__ == klass.prototype;
+  return obj.__proto__ === klass.prototype;
 }
 
 // ----------- validators -------------
@@ -36,7 +36,7 @@ function enumValidator(minval, maxval) {
 
 // Validates a field name or a single component of a message/enum name.
 function validateName(n) {
-  return /[_a-zA-Z][_a-zA-Z0-9]*/.match(n);
+  return n.match(/^[_a-zA-Z][_a-zA-Z0-9]*$/);
 }
 
 // Validates a message or enum type name.
@@ -61,7 +61,11 @@ validateTypeNameThrow = checkThrow(validateTypeName, "Invalid name");
 validateFieldType = enumValidator(1, 11);
 validateFieldTypeThrow = checkThrow(validateFieldType,
                                     "Invalid field type");
-validateFieldLabel = enumValidator(1, 3);
+validateFieldLabel = function(val) {
+  // No 'REQUIRED' -- proto2 not supported.
+  return val == exports.FieldDescriptor.LABEL_OPTIONAL ||
+         val == exports.FieldDescriptor.LABEL_REPEATED;
+}
 validateFieldLabelThrow = checkThrow(validateFieldLabel,
                                      "Invalid field label");
 
@@ -76,6 +80,12 @@ validateEnumValueThrow = checkThrow(validateEnumValue,
 function checkMut(obj) {
   if (Object.isFrozen(obj)) {
     throw new Error("Cannot change frozen object");
+  }
+}
+
+function checkList(obj) {
+  if (!isInstance(obj, Array)) {
+    throw new Error("Expected Array");
   }
 }
 
@@ -143,11 +153,13 @@ exports.Descriptor = function(name, fields, oneofs, is_mapentry) {
   defineROListProp(this, "oneofs");
   defineProp(this, "name", validateTypeNameThrow, name);
 
-  for (var i = 0; i < fields.length; i++) {
-    this.addField(fields[i]);
-  }
+  checkList(oneofs);
   for (var i = 0; i < oneofs.length; i++) {
     this.addOneof(oneofs[i]);
+  }
+  checkList(fields);
+  for (var i = 0; i < fields.length; i++) {
+    this.addField(fields[i]);
   }
 }
 
@@ -170,6 +182,7 @@ exports.Descriptor.prototype.addField = function(field) {
   this._fieldNumMap[field.number] = field;
   this._fields.push(field);
   field._descriptor = this;
+  return field;
 }
 
 exports.Descriptor.prototype.addOneof = function(oneof) {
@@ -185,6 +198,7 @@ exports.Descriptor.prototype.addOneof = function(oneof) {
     this.addField(oneof._fields[i]);
   }
   oneof._descriptor = this;
+  return oneof;
 }
 
 exports.Descriptor.prototype._checkFieldConflict = function(field) {
@@ -193,7 +207,7 @@ exports.Descriptor.prototype._checkFieldConflict = function(field) {
   if (this._fieldmap[field.name] !== undefined) {
     throw new Error("Duplicate field name: " + field.name);
   }
-  if (this._fieldNumMap[field.nubmer] !== undefined) {
+  if (this._fieldNumMap[field.number] !== undefined) {
     throw new Error("Duplicate field number: " + field.number);
   }
 }
@@ -205,9 +219,17 @@ exports.Descriptor.prototype._checkOneofConflict = function(oneof) {
   }
 }
 
+exports.Descriptor.prototype.toString = function() {
+  return "[Descriptor: " + this._name + "]";
+}
+
 // ----------- FieldDescriptor -------------
 
 exports.FieldDescriptor = function(obj) {
+  if (arguments.length < 1) {
+    obj = {};
+  }
+
   this._name = "";
   this._type = 0;
   this._label = 0;
@@ -223,13 +245,50 @@ exports.FieldDescriptor = function(obj) {
   defineProp(this, "number", validateFieldNumberThrow, obj.number);
   defineProp(this, "subtype_name", validateTypeNameThrow, obj.subtype_name);
 
+  Object.defineProperty(this, "subtype", {
+    get: function() {
+      if (!Object.isFrozen(this)) {
+        throw new Error(
+            "Cannot access subtype until after field is added to pool");
+      }
+      return this._subtype;
+    },
+    set: function() {
+      throw new Error("subtype is a read-only property");
+    }
+  });
+
   defineROProp(this, "descriptor");
   defineROProp(this, "oneof");
 }
 
+exports.FieldDescriptor.prototype.toString = function() {
+  return "[FieldDescriptor: " + this._name + "]";
+}
+
+exports.FieldDescriptor.TYPE_FLOAT   = 1;
+exports.FieldDescriptor.TYPE_DOUBLE  = 2;
+exports.FieldDescriptor.TYPE_BOOL    = 3;
+exports.FieldDescriptor.TYPE_STRING  = 4;
+exports.FieldDescriptor.TYPE_BYTES   = 5;
+exports.FieldDescriptor.TYPE_MESSAGE = 6;
+exports.FieldDescriptor.TYPE_ENUM    = 7;
+exports.FieldDescriptor.TYPE_INT32   = 8;
+exports.FieldDescriptor.TYPE_UINT32  = 9;
+exports.FieldDescriptor.TYPE_INT64   = 10;
+exports.FieldDescriptor.TYPE_UINT64  = 11;
+
+exports.FieldDescriptor.LABEL_OPTIONAL = 1;
+exports.FieldDescriptor.LABEL_REQUIRED = 2;
+exports.FieldDescriptor.LABEL_REPEATED = 3;
+
 // ----------- OneofDescriptor -------------
 
 exports.OneofDescriptor = function(name, fields) {
+  if (arguments.length < 2) {
+    fields = [];
+  }
+
   this._name = "";
   this._fields = [];
   this._fieldmap = {};
@@ -240,6 +299,7 @@ exports.OneofDescriptor = function(name, fields) {
   defineROListProp(this, "fields");
   defineROProp(this, "descriptor");
 
+  checkList(fields);
   for (var i = 0; i < fields.length; i++) {
     this.addField(fields[i]);
   }
@@ -250,40 +310,55 @@ exports.OneofDescriptor.prototype.findFieldByName = function(name) {
 }
 
 exports.OneofDescriptor.prototype.findFieldByNumber = function(number) {
-  return this._fieldNumMap[name];
+  return this._fieldNumMap[number];
 }
 
 exports.OneofDescriptor.prototype.addField = function(field) {
   checkMut(this);
-  // Add to parent descriptor first to catch any message-level name/number
-  // conflicts.
-  if (this._descriptor !== null) {
-    this._descriptor.addField(field);
+
+  var add_to_desc = false;
+  if (this._descriptor !== null &&
+      field.descriptor !== this._descriptor) {
+    add_to_desc = true;
+    this._descriptor._checkFieldConflict(field);
   }
+
   this._checkFieldConflict(field);
   this._fieldmap[field.name] = field;
   this._fieldNumMap[field.number] = field;
   this._fields.push(field);
   field._oneof = this;
+  if (add_to_desc) {
+    this._descriptor.addField(field);
+  }
+  return field;
 }
+
 exports.OneofDescriptor.prototype._checkFieldConflict = function(field) {
   validateNameThrow(field.name);
   validateFieldNumberThrow(field.number);
+  if (field._label !== exports.FieldDescriptor.LABEL_OPTIONAL) {
+    throw new Error("Can only add an optional field to a oneof");
+  }
   if (field._oneof !== null) {
     throw new Error("Field is already a member of a oneof");
   }
   if (this._fieldmap[field.name] !== undefined) {
     throw new Error("Duplicate field name: " + field.name);
   }
-  if (this._fieldNumMap[field.nubmer] !== undefined) {
+  if (this._fieldNumMap[field.number] !== undefined) {
     throw new Error("Duplicate field number: " + field.number);
   }
+}
+
+exports.OneofDescriptor.prototype.toString = function() {
+  return "[OneofDescriptor: " + this._name + "]";
 }
 
 // ----------- EnumDescriptor -------------
 
 exports.EnumDescriptor = function(name) {
-  this.name = name;
+  this._name = "";
   this._keys = [];
   this._values = [];
   this._map = {};
@@ -293,6 +368,11 @@ exports.EnumDescriptor = function(name) {
   defineROListProp(this, "keys");
   defineROListProp(this, "values");
 
+  if (arguments.length > 0 &&
+      (arguments.length & 1) != 1) {
+    throw new Error(
+        "EnumDescriptor constructor has mismatched key/value pairs");
+  }
   for (var i = 1; (i + 1) < arguments.length; i += 2) {
     var key = arguments[i];
     var value = arguments[i + 1];
@@ -309,6 +389,15 @@ exports.EnumDescriptor.prototype.add = function(key, value) {
   this._values.push(value);
   // Set up the constant itself.
   this[key] = value;
+  return key;
+}
+
+exports.EnumDescriptor.prototype.findByName = function(key) {
+  return this._map[key];
+}
+
+exports.EnumDescriptor.prototype.findByValue = function(value) {
+  return this._reverse_map[value];
 }
 
 exports.EnumDescriptor.prototype._checkConflict = function(key, value) {
@@ -322,13 +411,22 @@ exports.EnumDescriptor.prototype._checkConflict = function(key, value) {
   }
 }
 
+exports.EnumDescriptor.prototype.toString = function() {
+  return "[EnumDescriptor: " + this._name + "]";
+}
+
 // ----------- DescriptorPool -------------
 
 exports.DescriptorPool = function() {
   this._descmap = {};
+  this._descriptors = [];
+  this._enums = [];
+  defineROListProp(this, "descriptors");
+  defineROListProp(this, "enums");
 }
 
 exports.DescriptorPool.prototype.add = function(descs) {
+  checkList(descs);
   // Validate each descriptor individually to ensure all necessary information
   // is present.
   for (var i = 0; i < descs.length; i++) {
@@ -417,6 +515,7 @@ exports.DescriptorPool.prototype._validateOneof = function(oneof, desc) {
     if (field._descriptor !== desc) {
       throw new Error("Field descriptor backpointer was not properly set to " +
                       "descriptor");
+    }
     if (oneof.findFieldByName(field.name) !== field) {
       throw new Error("Field name changed after adding to oneof");
     }
@@ -459,6 +558,11 @@ exports.DescriptorPool.prototype._validateNameRefs =
 
 exports.DescriptorPool.prototype._addDesc = function(desc) {
   this._descmap[desc.name] = desc;
+  if (isInstance(desc, exports.Descriptor)) {
+    this._descriptors.push(desc);
+  } else if (isInstance(desc, exports.EnumDescriptor)) {
+    this._enums.push(desc);
+  }
   desc._pool = this;
 }
 
@@ -492,4 +596,8 @@ exports.DescriptorPool.prototype.lookup = function(name) {
   return this._descmap[name];
 }
 
-exports.DescriptorPool.generated_pool = new exports.DescriptorPool();
+exports.DescriptorPool.prototype.toString = function() {
+  return "[DescriptorPool]";
+}
+
+exports.DescriptorPool.generatedPool = new exports.DescriptorPool();

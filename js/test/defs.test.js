@@ -1,38 +1,6 @@
 var protobuf = require('google_protobuf_js');
 var assert = require('assert');
 
-// Test ReadOnlyArray
-(function() {
-  var a = new protobuf.ReadOnlyArray([1, 2, 3, 4]);
-  assert.equal(a.length, 4);
-  for (var i = 0; i < a.length; i++) {
-    assert.equal(a[i], i + 1);
-  }
-
-  assert.throws(function() {
-    a[1] = 42;
-  }, /elements cannot be changed/);
-
-  assert.equal(a[1], 2);
-
-  assert.throws(function() {
-    delete a[1];
-  }, /elements cannot be deleted/);
-
-  // Test iterator protocol. Without ES6, we don't have Symbol.iterator, but the
-  // array itself acts as an iterator.
-  var iterator = a;
-  var l = new Array();
-  for (var i = iterator.next(); !i.done; i = iterator.next()) {
-    l.push(i.value);
-  }
-  assert.equal(l.length, 4);
-  assert.equal(l[0], 1);
-  assert.equal(l[1], 2);
-  assert.equal(l[2], 3);
-  assert.equal(l[3], 4);
-})();
-
 // Test FieldDescriptor and Descriptor
 (function() {
   var m = new protobuf.Descriptor();
