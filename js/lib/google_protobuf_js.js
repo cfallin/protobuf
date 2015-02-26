@@ -4,7 +4,8 @@ function submodule(submod, name) {
   }
 }
 
-submodule(require('./google_protobuf_js/defs'));
+submodule(require('./google_protobuf_js/defs.js'));
+submodule(require('./google_protobuf_js/int64.js'));
 //submodule(require('./google_protobuf_js/rptfield'));
 //submodule(require('./google_protobuf_js/map'));
 //submodule(require('./google_protobuf_js/message'));
